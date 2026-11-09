@@ -1,6 +1,6 @@
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-use crate::client::connection::{ErrorOut, Out};
+use crate::client::connection::Out;
 use crate::client::incoming::IncomingMessage;
 use crate::client::{self};
 
@@ -9,14 +9,12 @@ use crate::client::{self};
 ///
 /// <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#baseProtocol>
 pub async fn get_message(
-    output: Out<impl AsyncRead + Unpin + Send + Sync>,
+    output: Out<impl AsyncBufRead + Unpin + Send + Sync>,
 ) -> std::result::Result<Option<IncomingMessage>, client::ReadError> {
     let body = {
         let mut guard = output.lock().await;
 
-        let mut reader = BufReader::new(&mut *guard);
-
-        let content_length = parse_content_length(&mut reader).await;
+        let content_length = parse_content_length(&mut *guard).await;
 
         if let Err(client::ReadError::CouldNotRead(err)) = &content_length
             && err.kind() == std::io::ErrorKind::UnexpectedEof
@@ -26,7 +24,7 @@ pub async fn get_message(
 
         let mut body = vec![0; content_length?];
 
-        reader
+        guard
             .read_exact(&mut body)
             .await
             .map_err(client::ReadError::CouldNotRead)?;
@@ -46,7 +44,7 @@ pub async fn get_message(
 
 /// <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#baseProtocol>
 async fn parse_content_length(
-    reader: &mut BufReader<impl AsyncRead + Unpin + Send>,
+    reader: &mut (impl AsyncBufRead + Unpin + Send),
 ) -> std::result::Result<usize, client::ReadError> {
     let mut is_first_read = true;
     let mut line = String::new();
@@ -123,24 +121,6 @@ async fn parse_content_length(
     Ok(content_length)
 }
 
-pub async fn handle_error(output: ErrorOut<impl AsyncRead + Unpin + Send>) {
-    let error = {
-        let mut error = String::new();
-
-        let mut guard = output.lock().await;
-
-        let mut reader = BufReader::new(&mut *guard);
-
-        if let Err(e) = reader.read_line(&mut error).await {
-            Err(e)
-        } else {
-            Ok(error)
-        }
-    };
-
-    log::warn!("Received an unexpected error message from language server: {error:?}");
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -180,7 +160,7 @@ mod tests {
     ) {
         let out = tokio_test::io::Builder::new().read(input).build();
 
-        let message = get_message(Arc::new(Mutex::new(out)))
+        let message = get_message(Arc::new(Mutex::new(tokio::io::BufReader::new(out))))
             .await
             .expect("Should always read a valid message");
 
@@ -193,7 +173,7 @@ mod tests {
             .read(b"Content-Length: 17\n\n{\"jsonrpc\":\"2.0\"}")
             .build();
 
-        let error = get_message(Arc::new(Mutex::new(out)))
+        let error = get_message(Arc::new(Mutex::new(tokio::io::BufReader::new(out))))
             .await
             .expect_err("Should always fail to read the malformed JSON");
 
@@ -210,7 +190,7 @@ mod tests {
             .read(b"Content-Length: 5\n\n{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
             .build();
 
-        let error = get_message(Arc::new(Mutex::new(out)))
+        let error = get_message(Arc::new(Mutex::new(tokio::io::BufReader::new(out))))
             .await
             .expect_err("Should always fail to read the malformed JSON");
 
@@ -233,7 +213,7 @@ mod tests {
     pub async fn test_reading_malformed_headers(#[case()] input: &[u8]) {
         let out = tokio_test::io::Builder::new().read(input).build();
 
-        let error = get_message(Arc::new(Mutex::new(out)))
+        let error = get_message(Arc::new(Mutex::new(tokio::io::BufReader::new(out))))
             .await
             .expect_err("Should always fail to read the malformed JSON");
 

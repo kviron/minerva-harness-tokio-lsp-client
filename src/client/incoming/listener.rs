@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::client::incoming::{self, IncomingError, IncomingMessage, IncomingResult, Subscriber};
 use crate::client::result::ServerMessage;
 use crate::types::NumberOrString;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncBufRead, AsyncRead};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -20,20 +20,19 @@ use crate::client::connection::{ErrorOut, Out};
 /// or request from the server, (2) any subscribed streams waiting for a response from a previous
 /// message.
 pub async fn listen_for_messages(
-    output: Out<impl AsyncRead + Unpin + Send + Sync>,
-    error: Option<ErrorOut<impl AsyncRead + Unpin + Send + Sync>>,
+    output: Out<impl AsyncBufRead + Unpin + Send + Sync>,
+    error: Option<ErrorOut<impl AsyncRead + Unpin + Send + Sync + 'static>>,
     subscribers: Subscribers,
     tx: Sender<ServerMessage>,
 ) {
+    if let Some(error) = error {
+        tokio::spawn(async move {
+            let mut error = error.lock().await;
+            let _ = tokio::io::copy(&mut *error, &mut tokio::io::sink()).await;
+        });
+    }
     loop {
-        let message = if let Some(error) = error.as_ref() {
-            tokio::select! {
-                message = incoming::get_message(Arc::clone(&output)) => message,
-                () = incoming::handle_error(Arc::clone(error)) => continue
-            }
-        } else {
-            incoming::get_message(Arc::clone(&output)).await
-        };
+        let message = incoming::get_message(Arc::clone(&output)).await;
 
         if let Err(error) = message {
             log::warn!(
@@ -80,9 +79,10 @@ pub async fn listen_for_messages(
 
                 match serde_json::from_value::<ServerMessage>(map) {
                     Ok(message) => broadcast_to_caller(&tx, message),
-                    Err(err) => log::warn!(
-                        "Invalid request ({method}) received from language server: {err}. ID: {id:?}. Parameters: {parameters:?}"
-                    ),
+                    Err(err) => {
+                        log::warn!("Unsupported request ({method}) from language server: {err}");
+                        broadcast_to_caller(&tx, ServerMessage::Request { id, parameters: crate::client::result::RequestParameters::Unknown });
+                    },
                 }
             }
             IncomingMessage::Notification {
@@ -299,6 +299,10 @@ mod test {
             }));
         }
     )]
+    #[case(
+        serde_json::json!({"jsonrpc":"2.0", "id":1234, "method":"custom/request", "params":{"x":1}}),
+        |incoming| assert!(matches!(incoming, ServerMessage::Request { id: NumberOrString::Number(1234), parameters: RequestParameters::Unknown }))
+    )]
     pub async fn test_listening_for_server_messages(
         #[case] incoming_message: Value,
         #[case] expected_server_message: impl FnOnce(ServerMessage),
@@ -307,7 +311,7 @@ mod test {
 
         let (output, mut handle) = tokio_test::io::Builder::new().build_with_handle();
 
-        let output = Arc::new(Mutex::new(output));
+        let output = Arc::new(Mutex::new(tokio::io::BufReader::new(output)));
 
         let subscribers: Subscribers = Arc::default();
 
@@ -405,7 +409,7 @@ mod test {
 
         let (output, mut handle) = tokio_test::io::Builder::new().build_with_handle();
 
-        let output = Arc::new(Mutex::new(output));
+        let output = Arc::new(Mutex::new(tokio::io::BufReader::new(output)));
 
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<ProtocolResult<IncomingResult, IncomingError>>(1);

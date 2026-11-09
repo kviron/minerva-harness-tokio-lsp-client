@@ -173,7 +173,7 @@ impl Client {
         let stdout = child
             .stdout
             .take()
-            .map(|stdout| Arc::new(Mutex::new(stdout)))
+            .map(|stdout| Arc::new(Mutex::new(tokio::io::BufReader::new(stdout))))
             .ok_or(client::ConnectionError::InvalidConnection)?;
         let stderr = child
             .stderr
@@ -318,61 +318,35 @@ impl Client {
         let request_id = NumberOrString::String(Uuid::new_v4().into());
         let cancellation_id = request_id.clone();
         let connection = Arc::clone(&self.connection);
-
-        let request_tokens = {
-            outgoing::send_request::<OR, _>(
-                &request_id,
-                &params,
-                &mut *self.connection.input().lock().await,
-            )
-            .await
+        let subscribers = Arc::clone(&self.subscribers);
+        let tokens = utils::token::extract_tokens_from_request_params(&serde_json::json!({"params": &params}));
+        let (tx, rx) = mpsc::channel::<ProtocolResult<IncomingResult, IncomingError>>(constant::RESULT_CHANNEL_BUFFER_CAPACITY);
+        {
+            let mut guard = self.subscribers.lock().await;
+            if let Some(token) = tokens.get_partial_result_token() {
+                guard.insert(token.clone(), Subscriber::new(tx.clone(), [Some(&request_id), tokens.get_work_done_token()]));
+            }
+            guard.insert(request_id.clone(), Subscriber::new(tx, tokens.iter()));
         }
-        .map_err(client::ProtocolError::Write)?;
-
-        CancellationGuard::with_guard(
-            async || {
-                let (tx, rx) = mpsc::channel::<ProtocolResult<IncomingResult, IncomingError>>(constant::RESULT_CHANNEL_BUFFER_CAPACITY);
-
-                let mut guard = self.subscribers.lock().await;
-
-                // If the request provided a token for the language server to stream back partial
-                // results using, also add the channel as a subscriber
-                if let Some(partial_result_token) = request_tokens.get_partial_result_token() {
-                    guard.insert(
-                        partial_result_token.clone(),
-                        Subscriber::new(tx.clone(), [
-                            Some(&request_id),
-                            request_tokens.get_work_done_token()
-                        ])
-                    );
-                }
-
-                // Add the channel as a subscriber for responses to the main request
-                guard.insert(request_id, Subscriber::new(tx.clone(), request_tokens.iter()));
-
+        let cancel_tokens = tokens.iter().flatten().cloned().collect::<Vec<_>>();
+        let outcome = CancellationGuard::with_guard(
+            async || outgoing::send_request::<OR, _>(&request_id, &params, &mut *self.connection.input().lock().await).await,
+            || Box::pin(async move {
+                let mut guard = subscribers.lock().await;
+                guard.remove(&cancellation_id);
+                for token in cancel_tokens { guard.remove(&token); }
                 drop(guard);
-
-                Ok(PartialResult::<OR>::new(rx))
-            },
-            || {
-                Box::pin(async move {
-                    let input = connection.input();
-                    let mut input = input.lock().await;
-
-                    if let Err(err) = outgoing::send_notification::<Cancel, _>(
-                        &CancelParams { id: cancellation_id.clone() },
-                        &mut *input,
-                    )
-                    .await
-                    {
-                        log::error!(
-                            "Unable to send cancellation notification for request {cancellation_id:?}: {err}",
-                        );
-                    }
-                })
-            },
-        )
-        .await
+                let input = connection.input();
+                let _ = outgoing::send_notification::<Cancel, _>(&CancelParams { id: cancellation_id }, &mut *input.lock().await).await;
+            }),
+        ).await;
+        if let Err(error) = outcome {
+            let mut guard = self.subscribers.lock().await;
+            guard.remove(&request_id);
+            for token in tokens.iter().flatten() { guard.remove(token); }
+            return Err(client::ProtocolError::Write(error));
+        }
+        Ok(PartialResult::<OR>::new(rx))
     }
 
     /// Send a result to the LSP server in response to a previous [`client::ServerMessage`].
@@ -481,6 +455,22 @@ mod tests {
     use super::types::{InitializeParams, WorkspaceSymbolParams, WorkspaceSymbolRequest};
     use super::*;
     use tokio::process::Command;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Python 3"]
+    async fn mh_fast_responses_are_received() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mh_fast_server.py");
+        let (client, _events) = Client::from_command(Command::new("python").arg(script)).unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..200 {
+            let client = client.clone();
+            tasks.spawn(async move {
+                let mut result = client.send_request::<WorkspaceSymbolRequest>(WorkspaceSymbolParams { query: String::new(), ..Default::default() }).await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), result.next()).await.unwrap().unwrap().unwrap();
+            });
+        }
+        while let Some(result) = tasks.join_next().await { result.unwrap(); }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[test_log::test]

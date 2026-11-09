@@ -258,6 +258,10 @@ pub enum RequestParameters {
 
     #[serde(rename = "workspaceSymbol/resolve")]
     WorkspaceSymbolResolve(WorkspaceSymbol),
+
+    /// An extension request not described by this client version.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Notification parameters which can be received through a [`crate::client::ServerMessage::Notification`].

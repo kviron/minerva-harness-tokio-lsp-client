@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
@@ -18,7 +18,7 @@ pub enum Connection {
         #[allow(dead_code)]
         process: Child,
         stdin: In<ChildStdin>,
-        stdout: Out<ChildStdout>,
+        stdout: Out<BufReader<ChildStdout>>,
         stderr: Option<ErrorOut<ChildStderr>>,
     },
     // TODO(RM): The language server protocol also recommends servers implement support
@@ -34,13 +34,13 @@ impl Connection {
         }
     }
 
-    pub(crate) fn output(&self) -> Out<impl AsyncRead> {
+    pub(crate) fn output(&self) -> Out<impl AsyncBufRead> {
         match self {
             Self::StdIo { stdout, .. } => Arc::clone(stdout),
         }
     }
 
-    pub(crate) fn error(&self) -> Option<ErrorOut<impl AsyncRead>> {
+    pub(crate) fn error(&self) -> Option<ErrorOut<impl AsyncRead + use<>>> {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
         match self {
@@ -52,3 +52,4 @@ impl Connection {
         }
     }
 }
+
